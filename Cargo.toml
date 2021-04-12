@@ -1,0 +1,6 @@
+[workspace]
+
+members = [
+    "vtest_on_old_windows",
+    "vtest_on_new_windows",
+]

@@ -1,0 +1,165 @@
+use gen::{NamespaceTypes, TypeLimit, TypeLimits, TypeReader, TypeTree};
+use std::convert::{TryFrom, TryInto};
+use syn::spanned::Spanned;
+
+pub struct BuildLimits(pub std::collections::BTreeSet<TypesDeclaration>);
+
+impl BuildLimits {
+    pub fn into_tokens_string(self) -> Result<String, proc_macro2::TokenStream> {
+        let reader = TypeReader::get();
+        let mut limits = TypeLimits::new(reader);
+
+        for limit in self.0 {
+            let types = limit.types;
+            let syntax = limit.syntax;
+            limits.insert(types).map_err(|ns| {
+                syn::Error::new_spanned(syntax, format!("'{}' is not a known namespace", ns))
+                    .to_compile_error()
+            })?;
+        }
+
+        let tree = TypeTree::from_limits(reader, &limits);
+
+        let ts = tree
+            .gen(&tree)
+            .fold(squote::TokenStream::new(), |mut accum, n| {
+                accum.combine(&n);
+                accum
+            });
+
+        Ok(ts.into_string())
+    }
+}
+
+pub struct TypesDeclaration {
+    pub types: NamespaceTypes,
+    pub syntax: syn::UseTree,
+}
+
+impl std::cmp::PartialOrd for TypesDeclaration {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::cmp::Ord for TypesDeclaration {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.types.cmp(&other.types)
+    }
+}
+
+impl PartialEq for TypesDeclaration {
+    fn eq(&self, other: &Self) -> bool {
+        self.types == other.types
+    }
+}
+
+impl Eq for TypesDeclaration {}
+
+impl TryFrom<syn::UseTree> for TypesDeclaration {
+    type Error = syn::Error;
+    fn try_from(tree: syn::UseTree) -> Result<Self, Self::Error> {
+        Ok(Self {
+            types: use_tree_to_namespace_types(&tree)?,
+            syntax: tree,
+        })
+    }
+}
+
+impl syn::parse::Parse for BuildLimits {
+    fn parse(input: syn::parse::ParseStream) -> syn::parse::Result<Self> {
+        let mut limits = std::collections::BTreeSet::new();
+        loop {
+            if input.is_empty() {
+                break;
+            }
+
+            let use_tree: syn::UseTree = input.parse()?;
+            let limit: TypesDeclaration = use_tree.try_into()?;
+
+            limits.insert(limit);
+
+            if !input.is_empty() {
+                input.parse::<syn::Token![,]>()?;
+            }
+        }
+        Ok(Self(limits))
+    }
+}
+
+fn use_tree_to_namespace_types(use_tree: &syn::UseTree) -> syn::parse::Result<NamespaceTypes> {
+    let reader = TypeReader::get();
+    fn recurse(
+        reader: &'static TypeReader,
+        tree: &syn::UseTree,
+        current: &mut String,
+    ) -> syn::parse::Result<NamespaceTypes> {
+        match tree {
+            syn::UseTree::Path(p) => {
+                if !current.is_empty() {
+                    current.push('.');
+                }
+
+                current.push_str(&p.ident.to_string());
+
+                recurse(reader, &*p.tree, current)
+            }
+            syn::UseTree::Glob(g) => {
+                let namespace = find_namespace(reader, current.trim_matches('"'), g.span())?;
+                Ok(NamespaceTypes {
+                    namespace,
+                    limit: TypeLimit::All,
+                })
+            }
+            syn::UseTree::Group(g) => {
+                let namespace = find_namespace(reader, current.trim_matches('"'), g.span())?;
+
+                let mut types = Vec::with_capacity(g.items.len());
+                for tree in &g.items {
+                    match tree {
+                        syn::UseTree::Name(n) => {
+                            types.push(n.ident.to_string());
+                        }
+                        syn::UseTree::Rename(_) => {
+                            return Err(syn::Error::new(
+                                tree.span(),
+                                "Renaming syntax is not supported",
+                            ))
+                        }
+                        _ => return Err(syn::Error::new(tree.span(), "Nested paths not allowed")),
+                    }
+                }
+                Ok(NamespaceTypes {
+                    namespace,
+                    limit: TypeLimit::Some(types),
+                })
+            }
+            syn::UseTree::Name(n) => {
+                let namespace = find_namespace(reader, current.trim_matches('"'), n.span())?;
+                let name = n.ident.to_string();
+                Ok(NamespaceTypes {
+                    namespace,
+                    limit: TypeLimit::Some(vec![name]),
+                })
+            }
+            syn::UseTree::Rename(r) => Err(syn::Error::new(
+                r.span(),
+                "Renaming syntax is not supported",
+            )),
+        }
+    }
+
+    recurse(reader, use_tree, &mut String::new())
+}
+
+fn find_namespace(
+    reader: &'static TypeReader,
+    namespace: &str,
+    span: proc_macro2::Span,
+) -> syn::parse::Result<&'static str> {
+    if let Some(namespace) = reader.find_namespace(&namespace) {
+        Ok(namespace)
+    } else {
+        Err(syn::Error::new(span, "Module not found"))
+    }
+}
